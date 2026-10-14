@@ -154,7 +154,10 @@ def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[],
 def _evict_modules(module_name: str) -> None:
     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
     prefix = f"{module_name}."
-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
+    # list(): a plugin load runs on a deadline worker while the main thread keeps importing,
+    # and every import mutates sys.modules — iterating it directly raises
+    # "dictionary changed size during iteration" and kills a random plugin's load.
+    for name in [n for n in list(sys.modules) if n == module_name or n.startswith(prefix)]:
         del sys.modules[name]
 
 
