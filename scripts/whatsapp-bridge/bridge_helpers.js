@@ -1,7 +1,48 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
+import { mkdirSync, writeFileSync, appendFileSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { format } from 'util';
+
+const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
+
+/** ``HERMES_WA_OBSERVER`` (default on) → boolean. Solo ``off`` explícito lo apaga. */
+export function observerEnabled(raw) {
+  return TRUTHY.has(String(raw ?? 'on').trim().toLowerCase());
+}
+
+/**
+ * Línea JSON de UN mensaje observado. Puro: sin fs, sin reloj propio (``now``
+ * inyectable para el test). El bridge no archiva nada por su cuenta, así que
+ * esta línea es la única recuperación posterior de "qué se dijo".
+ */
+export function observedLine({ direction = 'in', chatId, senderId, messageId, text, hasMedia, mediaType, quotedText, fromMe }, now = new Date()) {
+  return `${JSON.stringify({
+    ts: now.toISOString(),
+    direction,
+    fromMe: !!fromMe,
+    chatId: chatId || '',
+    sender: senderId || '',
+    messageId: messageId || '',
+    text: text || '',
+    hasMedia: !!hasMedia,
+    mediaType: mediaType || '',
+    quotedText: quotedText || '',
+  })}\n`;
+}
+
+/**
+ * Añade una línea al log de observación. Crea el directorio si falta y jamás
+ * lanza: un fallo de log no puede tumbar el intake del mensaje.
+ */
+export function appendObservedLine(file, line) {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    appendFileSync(file, line);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',

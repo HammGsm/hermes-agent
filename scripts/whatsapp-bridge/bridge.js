@@ -35,6 +35,7 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   addMentions,
+  appendObservedLine,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -49,6 +50,8 @@ import {
   inferMediaType,
   mediaPayloadForFile,
   normalizeWhatsAppId,
+  observedLine,
+  observerEnabled,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   writeJsonLine,
@@ -252,6 +255,23 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
+
+// ── Observador de grupos (solo lectura) ──────────────────────────────────────
+// El bridge NO archiva mensajes: messageQueue se vacía en cada poll y
+// messageStore es memoria acotada (512, solo quotes/polls). Sin esto, "qué se
+// dijo hoy en el grupo X" es irrecuperable pasado el momento. Escribe una línea
+// JSON por mensaje ANTES de la compuerta de intake, así lo que el gate descarta
+// también queda registrado. No envía nada: es un log, no un reply.
+const WA_OBSERVER_ON = observerEnabled(process.env.HERMES_WA_OBSERVER);
+// Ruta FUERA de bridge.log (que el adapter trunca al arrancar): una línea por
+// mensaje, append puro.
+const WA_OBSERVER_FILE = process.env.HERMES_WA_OBSERVER_FILE
+  || path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'observed.jsonl');
+
+function logObserved(fields) {
+  if (!WA_OBSERVER_ON) return;
+  appendObservedLine(WA_OBSERVER_FILE, observedLine(fields));
+}
 
 // Message queue for polling
 const messageQueue = [];
@@ -743,6 +763,33 @@ async function startSocket() {
       });
       event.fromOwner = fromOwner;
 
+      // Observador (solo lectura): registra TODO lo que entra, antes de las
+      // compuertas. Va aquí, no tras `continue`, porque los grupos `fromMe` y
+      // los rechazados por allowlist son justamente lo que hoy se pierde.
+      // `fromMe` no es "yo escribí": el bridge manda las respuestas con el
+      // prefijo REPLY_PREFIX desde el socket del dueño, así que el prefijo es
+      // la única señal del transporte que distingue respuesta de mensaje humano.
+      // shortcut: `event` solo existe tras extractBridgeEvent, asi que los mensajes
+      // que las compuertas ya descartaron (fromMe de grupo, allowlist) NO se observan;
+      // mover el extract antes de las compuertas cuando el autor lo resuelva.
+      if (isGroup) {
+        const bare = senderNumber.replace(/@.*/, '');
+        logObserved({
+          direction: msg.key.fromMe ? 'out' : 'in',
+          fromMe: !!msg.key.fromMe,
+          chatId,
+          senderId: lidToPhone[bare] || senderNumber,
+          messageId: msg.key.id,
+          text: msg.key.fromMe && REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)
+            ? event.body.slice(REPLY_PREFIX.length)
+            : event.body,
+          hasMedia: event.hasMedia,
+          mediaType: event.mediaType,
+          quotedText: event.quotedText,
+        });
+      }
+
+
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
       if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
         if (WHATSAPP_DEBUG) {
@@ -1135,6 +1182,20 @@ app.get('/health', (req, res) => {
     // path.resolve, not realpath: the adapter compares against os.path.abspath, which keeps symlinks.
     session: path.resolve(SESSION_DIR),
     capabilities: { outboundMentions: true },
+    // Compuerta efectiva, legible por efecto: sin esto "solo autorizados" es
+    // una promesa; con esto se audita contra el proceso vivo, no contra el .env.
+    gate: {
+      mode: WHATSAPP_MODE,
+      dmPolicy: WHATSAPP_DM_POLICY,
+      groupPolicy: WHATSAPP_GROUP_POLICY,
+      // [...] obligatorio: ALLOWED_USERS es un Set y JSON.stringify(Set) === "{}"
+      // — reportarlo crudo hace que una compuerta correcta parezca vacía.
+      allowedUsers: [...ALLOWED_USERS],
+      groupAllowedUsers: [...GROUP_ALLOWED_USERS],
+      // require_mention NO vive aquí: el bridge no gatea por mención, lo hace el
+      // adapter Python tras el intake (ver comentario en la línea ~130).
+      observer: { enabled: WA_OBSERVER_ON, file: WA_OBSERVER_FILE },
+    },
   });
 });
 
