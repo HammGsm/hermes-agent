@@ -73,6 +73,7 @@ class GatewaySessionStore:
         self.current: dict | None = None
         self._reader = None
         self._create_parameters = None
+        self._create_sources = None
 
     def __bool__(self):
         return not self.connection.final
@@ -191,7 +192,7 @@ class GatewaySessionStore:
         return self._adopt(snapshot)
 
     def _create_params(self, launch, title, record_cwd):
-        from agent.session_source import CLI_FAMILY_SOURCES, create_surface, session_source_for
+        from agent.session_source import CLI_FAMILY_SOURCES, ONESHOT_SOURCE, create_surface, session_source_for
         params = _creation_policy(launch or {})
         params["cwd"] = _launch_cwd()
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
@@ -203,6 +204,14 @@ class GatewaySessionStore:
         if title:
             params["title"] = title
         params.update(self.client_env())
+        # ``hermes chat`` launched from inside a Hermes session (kanban worker, a messaging channel's
+        # terminal tool) inherits HERMES_SESSION_SOURCE, and the owner only takes its own session.create
+        # vocabulary: it refuses the rest with ``4001 invalid_params`` before any turn (the CLI then
+        # reports it as a model-connection failure). Send the CLI-family label the owner does take.
+        if self._create_sources and params["source"] not in self._create_sources:
+            from gateway.session_context import get_session_env
+            params["source"] = (ONESHOT_SOURCE if get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1"
+                                else "cli")
         params["request_id"] = uuid.uuid4().hex
         return params
 
@@ -212,7 +221,11 @@ class GatewaySessionStore:
         if self._create_parameters is None:
             described = self.call("runtime.describe")
             contract = described.get("session_create") if isinstance(described, dict) else None
-            self._create_parameters = list((contract or {}).get("parameters") or [])
+            contract = contract if isinstance(contract, dict) else {}
+            self._create_parameters = list(contract.get("parameters") or [])
+            # The ``source`` labels the owner accepts on session.create: a CLI launched from inside a
+            # Hermes session inherits HERMES_SESSION_SOURCE, which may be outside this vocabulary.
+            self._create_sources = [str(item) for item in (contract.get("sources") or []) if isinstance(item, str)]
         return client_env_policy(self._create_parameters)
 
     def branch(self, session_id, title=None):
